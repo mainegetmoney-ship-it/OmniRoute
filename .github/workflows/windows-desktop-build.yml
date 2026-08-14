@@ -1,0 +1,191 @@
+name: Build Windows Desktop App
+
+# Windows-only desktop build for this fork.
+#
+# Why this exists alongside electron-release.yml:
+#   electron-release.yml is the UPSTREAM four-platform release path. It also runs
+#   `publish-npm` (publishes the `omniroute` package to the public registry) and gates
+#   on `verify-desktop-assets`, which fails unless .dmg/.AppImage/.deb are all present.
+#   Neither is appropriate for producing a single Windows installer from a fork:
+#   publishing to npm from a fork is wrong, and two macOS runners bill ~10x Linux for
+#   artifacts nobody asked for.
+#
+#   This workflow is additive on purpose — electron-release.yml carries incident
+#   knowledge (v3.8.48 manifest collision, v3.8.49 zero-asset release) that must not be
+#   disturbed to serve a narrower need.
+#
+# Trigger it manually: Actions -> "Build Windows Desktop App" -> Run workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version for the build, e.g. v3.8.50 (defaults to package.json)"
+        required: false
+        type: string
+      create_release:
+        description: "Attach the installers to a GitHub Release"
+        required: false
+        default: true
+        type: boolean
+
+# Least-privilege default; jobs opt into the writes they need.
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows installer
+    runs-on: windows-latest
+    permissions:
+      contents: write # create the release / upload assets
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        # Workflow inputs are passed via env, never interpolated into the script body
+        # (zizmor template-injection mitigation). The value is regex-validated before use.
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            VERSION="$INPUT_VERSION"
+            if [[ ! "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Invalid version format '$VERSION'. Expected vX.Y.Z (e.g. v3.8.50)."
+              exit 1
+            fi
+          else
+            VERSION="v$(node -p "require('./package.json').version")"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building $VERSION"
+
+      - name: Install dependencies
+        run: npm ci
+        env:
+          NPM_CONFIG_LEGACY_PEER_DEPS: true
+
+      - name: Sanitize Windows home directory
+        shell: bash
+        # The default USERPROFILE contains junction points (Application Data) that cause
+        # EPERM errors during the Next.js standalone build's glob scans.
+        run: |
+          mkdir -p "$RUNNER_TEMP/home"
+          echo "USERPROFILE=$RUNNER_TEMP/home" >> "$GITHUB_ENV"
+
+      - name: Build Next.js standalone
+        env:
+          JWT_SECRET: ci-build-secret-with-sufficient-length-for-validation
+          NODE_OPTIONS: "--max_old_space_size=6144"
+          # Turbopack (default) is correct here: the hosted Windows runner has the
+          # headroom for it. The webpack fallback (OMNIROUTE_USE_TURBOPACK=0) is only
+          # needed on RAM-constrained machines, where Turbopack's native Rust
+          # allocations escape --max_old_space_size and get OOM-killed (#6409).
+          OMNIROUTE_USE_TURBOPACK: "1"
+        run: npm run build
+
+      - name: Verify the standalone bundle actually exists
+        shell: bash
+        # `next build` has historically been killed mid-compile while the wrapper still
+        # reported success, producing an empty .build. Assert artifacts on disk rather
+        # than trusting the exit code alone.
+        run: |
+          if ! find .build -maxdepth 4 -name server.js | grep -q .; then
+            echo "::error::Next standalone build produced no server.js — build did not complete."
+            exit 1
+          fi
+          echo "✓ standalone server.js present"
+
+      - name: Sync version in electron/package.json
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          VERSION_NO_V="${VERSION#v}"
+          export VERSION_NO_V
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('electron/package.json'));
+            pkg.version = process.env.VERSION_NO_V;
+            fs.writeFileSync('electron/package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+          echo "✓ electron/package.json version set to $VERSION_NO_V"
+
+      - name: Install Electron dependencies
+        working-directory: electron
+        run: npm install --no-audit --no-fund
+
+      - name: Build Electron for Windows
+        working-directory: electron
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run build:win
+
+      - name: Collect installers
+        shell: bash
+        # electron-builder emits an NSIS installer ("... Setup <version>.exe") and a
+        # portable exe. Both are shipped; the portable one is renamed to a stable,
+        # predictable OmniRoute.exe so a download link does not change every version.
+        run: |
+          mkdir -p release-assets
+          cd electron/dist-electron
+          for file in *.exe; do
+            [ -f "$file" ] || continue
+            cp "$file" ../../release-assets/
+            case "$file" in
+              *Setup*) ;;
+              *) cp "$file" "../../release-assets/OmniRoute.exe" ;;
+            esac
+          done
+          # electron-updater manifest must ship alongside the installers, or autoUpdater
+          # fails with "Cannot find latest.yml in the latest release artifacts" (#6766).
+          for file in latest*.yml; do
+            [ -f "$file" ] && cp "$file" ../../release-assets/
+          done
+          echo "release-assets:"
+          ls -la ../../release-assets/
+
+      - name: Assert an installer was produced
+        shell: bash
+        run: |
+          if ! ls release-assets/*.exe >/dev/null 2>&1; then
+            echo "::error::No .exe produced — electron-builder did not emit a Windows installer."
+            exit 1
+          fi
+          echo "✓ Windows installer present"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: omniroute-windows
+          path: release-assets/
+
+      - name: Create Release
+        if: ${{ inputs.create_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: OmniRoute ${{ steps.version.outputs.version }} (Windows)
+          draft: false
+          # Marked prerelease: this is a fork build of the desktop app, not an official
+          # upstream OmniRoute release. Keeping that distinction honest matters.
+          prerelease: true
+          generate_release_notes: true
+          fail_on_unmatched_files: false
+          files: |
+            release-assets/*.exe
+            release-assets/*.blockmap
+            release-assets/*.yml
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
