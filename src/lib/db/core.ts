@@ -970,6 +970,27 @@ export function runManagedDbHealthCheck(options?: { autoRepair?: boolean }) {
   });
 }
 
+/**
+ * Whether `sqliteFile` should be treated as a brand-new database.
+ *
+ * A missing file is obviously new. A file that exists but is EMPTY (0 bytes) holds
+ * no database either, so it is new as well: an interrupted first launch, a full
+ * disk, or a killed installer can leave a zero-byte `storage.sqlite` behind.
+ * Treating that as an *existing* database made the migration runner trip its
+ * mass-migration safety abort and refuse to start the server entirely — a dead end
+ * for desktop users, who saw only a generic startup error.
+ *
+ * Anything with actual bytes keeps the existing-database safety checks.
+ */
+export function isEffectivelyNewDatabase(sqliteFile: string): boolean {
+  try {
+    return fs.statSync(sqliteFile).size === 0;
+  } catch {
+    // Missing (ENOENT) or unstattable — nothing usable is there, so treat as new.
+    return true;
+  }
+}
+
 export function getDbInstance(): SqliteDatabase {
   const existing = getDb();
   if (existing) return existing;
@@ -1045,7 +1066,7 @@ export function getDbInstance(): SqliteDatabase {
   // This is needed so the migration runner skips the mass-migration safety abort
   // that would otherwise trigger because heuristic seeding marks some migrations
   // as applied, making the fresh DB look like a wiped existing DB (#1328).
-  const isNewDb = !fs.existsSync(sqliteFile);
+  const isNewDb = isEffectivelyNewDatabase(sqliteFile);
 
   // Detect and handle old schema format — preserve data when possible (#146)
   // Uses a single probe connection that becomes the real connection when possible.
