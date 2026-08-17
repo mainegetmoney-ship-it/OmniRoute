@@ -502,10 +502,6 @@ const SCHEMA_SQL = `
 
 declare global {
   var __omnirouteDb: SqliteAdapter | undefined;
-  // Cycle-breaker counter for the probe-failed/restore cascade. Survives
-  // Next.js HMR re-evaluations so concurrent subsystems all see the same
-  // count and we abort with a clear error instead of looping forever.
-  var __omnirouteDbProbeRestoreCount: number | undefined;
   // Cycle-breaker counter for the OOM-during-probe path (#6835). Unlike the
   // generic corruption path above, an OOM probe failure never renames the
   // file away (intentional — the DB may be perfectly fine, just too large
@@ -548,23 +544,35 @@ function summarizeSkippedTables(tables: SkippedTableSnapshot[]): string {
 
 function listProbeFailureBackups(sqliteFile: string): string[] {
   const directory = path.dirname(sqliteFile);
-  const baseName = path.basename(sqliteFile);
-  const prefix = `${baseName}.probe-failed-`;
+  const prefix = `${path.basename(sqliteFile)}.probe-failed-`;
   if (!fs.existsSync(directory)) return [];
 
   return fs
     .readdirSync(directory)
-    .filter((name) => name.startsWith(prefix))
-    .map((name) => ({
-      path: path.join(directory, name),
-      timestamp: Number(name.slice(prefix.length)),
-    }))
-    .sort((left, right) => {
-      const leftTimestamp = Number.isFinite(left.timestamp) ? left.timestamp : 0;
-      const rightTimestamp = Number.isFinite(right.timestamp) ? right.timestamp : 0;
-      return rightTimestamp - leftTimestamp || right.path.localeCompare(left.path);
-    })
-    .map((backup) => backup.path);
+    .filter((name) => name.startsWith(prefix) && !name.endsWith("-wal") && !name.endsWith("-shm"))
+    .map((name) => path.join(directory, name))
+    .sort();
+}
+
+function quarantineSqliteFiles(sqliteFile: string, timestamp: number): string {
+  const failedPath = `${sqliteFile}.probe-failed-${timestamp}`;
+  fs.renameSync(sqliteFile, failedPath);
+
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    const sidecar = `${sqliteFile}${suffix}`;
+    if (!fs.existsSync(sidecar)) continue;
+    try {
+      fs.renameSync(sidecar, `${failedPath}${suffix}`);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new Error(
+        `[DB] Manual recovery required: preserved the main database at ${failedPath}, ` +
+          `but could not quarantine its ${suffix} sidecar ${sidecar}: ${message}.`
+      );
+    }
+  }
+
+  return failedPath;
 }
 
 function captureCriticalDbState(sqliteFile: string): PreservedCriticalDbState {
@@ -970,6 +978,27 @@ export function runManagedDbHealthCheck(options?: { autoRepair?: boolean }) {
   });
 }
 
+/**
+ * Whether `sqliteFile` should be treated as a brand-new database.
+ *
+ * A missing file is obviously new. A file that exists but is EMPTY (0 bytes) holds
+ * no database either, so it is new as well: an interrupted first launch, a full
+ * disk, or a killed installer can leave a zero-byte `storage.sqlite` behind.
+ * Treating that as an *existing* database made the migration runner trip its
+ * mass-migration safety abort and refuse to start the server entirely — a dead end
+ * for desktop users, who saw only a generic startup error.
+ *
+ * Anything with actual bytes keeps the existing-database safety checks.
+ */
+export function isEffectivelyNewDatabase(sqliteFile: string): boolean {
+  try {
+    return fs.statSync(sqliteFile).size === 0;
+  } catch {
+    // Missing (ENOENT) or unstattable — nothing usable is there, so treat as new.
+    return true;
+  }
+}
+
 export function getDbInstance(): SqliteDatabase {
   const existing = getDb();
   if (existing) return existing;
@@ -994,40 +1023,14 @@ export function getDbInstance(): SqliteDatabase {
     throw new Error("SQLITE_FILE is unavailable for local mode");
   }
   const jsonDbFile = JSON_DB_FILE;
-  const probeFailureBackups = listProbeFailureBackups(sqliteFile);
-  if (!fs.existsSync(sqliteFile) && probeFailureBackups.length > 0) {
-    // Cycle-breaker: a previous probe failure renamed the DB to
-    // `storage.sqlite.probe-failed-<ts>` and the next caller auto-restored it.
-    // When the same DB continues to fail the probe (typically an OOM on a
-    // large sql.js WASM load), the rename/restore cascade loops forever
-    // because every subsystem (BATCH, HealthCheck, ProviderLimitsSync, ...)
-    // hits the same code path during boot. Track restoration attempts on
-    // globalThis; abort with a clear recovery message after 3 attempts so
-    // the user gets a real error instead of a hung "Starting server...".
-    if (
-      (globalThis.__omnirouteDbProbeRestoreCount =
-        (globalThis.__omnirouteDbProbeRestoreCount || 0) + 1) > 3
-    ) {
-      throw new Error(
-        `[DB] Aborting startup: probe-failed/restore loop detected after 3 attempts. ` +
-          `The preserved database at ${path.dirname(sqliteFile)} is unloadable under this runtime. ` +
-          `Remove the probe-failed backups (storage.sqlite.probe-failed-*) from ${path.dirname(
-            sqliteFile
-          )} and restart, or restore the database from a known-good backup.`
-      );
-    }
-    const latestBackup = probeFailureBackups[0];
-    try {
-      fs.renameSync(latestBackup, sqliteFile);
-      console.log(
-        `[DB] Auto-restored preserved database from previous probe failure: ${path.basename(latestBackup)}`
-      );
-    } catch (error: unknown) {
-      const msg = error instanceof Error ? error.message : String(error);
-      throw new Error(
-        `[DB] Manual recovery required before startup. ` +
-          `Failed to auto-restore preserved database ${latestBackup}: ${msg}. ` +
-          `Restore the preserved file or another backup to ${sqliteFile} before restarting.`
+  if (!fs.existsSync(sqliteFile)) {
+    const quarantinedDatabases = listProbeFailureBackups(sqliteFile);
+    if (quarantinedDatabases.length > 0) {
+      console.warn(
+        `[DB] Found ${quarantinedDatabases.length} quarantined database(s); leaving them untouched ` +
+          `and initializing a clean database at ${sqliteFile}. Recovery files: ${quarantinedDatabases.join(
+            ", "
+          )}`
       );
     }
   }
@@ -1045,13 +1048,14 @@ export function getDbInstance(): SqliteDatabase {
   // This is needed so the migration runner skips the mass-migration safety abort
   // that would otherwise trigger because heuristic seeding marks some migrations
   // as applied, making the fresh DB look like a wiped existing DB (#1328).
-  const isNewDb = !fs.existsSync(sqliteFile);
+  let isNewDb = isEffectivelyNewDatabase(sqliteFile);
 
   // Detect and handle old schema format — preserve data when possible (#146)
   // Uses a single probe connection that becomes the real connection when possible.
   if (fs.existsSync(sqliteFile)) {
+    let probe: SqliteDatabase | null = null;
     try {
-      const probe = openSqliteDatabase(sqliteFile, { readonly: true });
+      probe = openSqliteDatabase(sqliteFile, { readonly: true });
       const hasOldSchema = probe
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'")
         .get();
@@ -1066,6 +1070,7 @@ export function getDbInstance(): SqliteDatabase {
           // Table might not exist at all — truly incompatible
         }
         closeProbeIfSafe(probe);
+        probe = null;
 
         if (hasData) {
           console.log(
@@ -1097,8 +1102,14 @@ export function getDbInstance(): SqliteDatabase {
         }
       } else {
         closeProbeIfSafe(probe);
+        probe = null;
       }
     } catch (e: unknown) {
+      try {
+        closeProbeIfSafe(probe);
+      } catch {
+        /* ignore; the original probe error is more useful */
+      }
       const message = e instanceof Error ? e.message : String(e);
       console.warn("[DB] Could not probe existing DB:", message);
 
@@ -1147,14 +1158,21 @@ export function getDbInstance(): SqliteDatabase {
         preservedCriticalState = captureCriticalDbState(sqliteFile);
         // SAFETY: Never delete the database — rename to backup so data can be recovered.
         // The old code would silently destroy all user data on any probe failure.
-        const failedPath = sqliteFile + `.probe-failed-${Date.now()}`;
         try {
-          fs.renameSync(sqliteFile, failedPath);
+          const failedPath = quarantineSqliteFiles(sqliteFile, Date.now());
           console.warn(`[DB] Renamed corrupt DB to ${path.basename(failedPath)}`);
           failedProbePath = failedPath;
           failedProbeMessage = message;
-        } catch {
-          /* ok */
+          // The live path is now intentionally empty. Its replacement must use fresh-DB
+          // migration semantics; the quarantined file remains available for recovery.
+          isNewDb = true;
+        } catch (quarantineError: unknown) {
+          const quarantineMessage =
+            quarantineError instanceof Error ? quarantineError.message : String(quarantineError);
+          throw new Error(
+            `[DB] Manual recovery required: could not safely quarantine ${sqliteFile}. ` +
+              `${quarantineMessage}`
+          );
         }
       }
     }
@@ -1162,16 +1180,23 @@ export function getDbInstance(): SqliteDatabase {
 
   if (failedProbePath) {
     const hasUnsafeSkippedTables = preservedCriticalState.skippedTables.length > 0;
-    const missingSnapshot = !preservedCriticalState.captureSucceeded;
-    if (hasUnsafeSkippedTables || missingSnapshot) {
-      const details = missingSnapshot
-        ? `snapshot_failed=${preservedCriticalState.captureError || "unknown"}`
-        : `skipped_tables=${summarizeSkippedTables(preservedCriticalState.skippedTables)}`;
+    if (hasUnsafeSkippedTables) {
       throw new Error(
         `[DB] Manual recovery required after probe failure. ` +
           `Preserved database: ${failedProbePath}. ` +
-          `Automatic recovery was aborted because ${details}. ` +
+          `Automatic recovery was aborted because skipped_tables=${summarizeSkippedTables(
+            preservedCriticalState.skippedTables
+          )}. ` +
           `Original probe error: ${failedProbeMessage || "unknown"}.`
+      );
+    }
+
+    if (!preservedCriticalState.captureSucceeded) {
+      console.warn(
+        `[DB] The unreadable database remains quarantined at ${failedProbePath}. ` +
+          `Starting with a clean database; no file was deleted. ` +
+          `To recover data, keep this file and restore it with SQLite recovery tools or a ` +
+          `known-good backup. Snapshot error: ${preservedCriticalState.captureError || "unknown"}.`
       );
     }
   }
